@@ -2,8 +2,9 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Upload, X, Download, Image as ImageIcon, CheckCircle, Loader2, Edit2, RotateCcw, SlidersHorizontal } from 'lucide-react';
+import { Upload, X, Download, Image as ImageIcon, CheckCircle, Loader2, Edit2, RotateCcw, SlidersHorizontal, Wand2 } from 'lucide-react';
 import { getColor } from 'colorthief';
+import { readMetadataBrowser, writeMetadataBrowser } from '@/lib/audio-engine-client';
 
 const REMOTE_RANDOM_ARTS = [
   'https://coverartarchive.org/release/fed37cfc-293e-43aa-9391-582845667119/front',
@@ -214,31 +215,26 @@ export default function Home() {
     if (!uploadedFile) return;
 
     setIsUploading(true);
-    const formData = new FormData();
-    formData.append('file', uploadedFile);
-
+    
     try {
-      const response = await fetch('/api/upload', {
-        method: 'POST',
-        body: formData,
-      });
-      const data = await response.json();
+      const parsedMetadata = await readMetadataBrowser(uploadedFile);
 
-      if (data.success) {
-        setFile(uploadedFile);
-        setMetadata(data.metadata);
-        setOriginalMetadata(JSON.parse(JSON.stringify(data.metadata)));
-        setFileId(data.fileId);
-        setExtension(data.extension);
-        
-        if (data.metadata.picture) {
-          extractColor(data.metadata.picture.data, data.metadata.picture.format);
-        }
-
-        handleAutofill(data.metadata.artist, data.metadata.title);
+      setFile(uploadedFile);
+      setMetadata(parsedMetadata);
+      setOriginalMetadata(JSON.parse(JSON.stringify(parsedMetadata)));
+      
+      const originalName = uploadedFile.name || '';
+      const parsedExt = originalName.substring(originalName.lastIndexOf('.'));
+      setExtension(parsedExt);
+      
+      if (parsedMetadata.picture) {
+        extractColor(parsedMetadata.picture.data, parsedMetadata.picture.format);
       }
+
+      handleAutofill(parsedMetadata.artist, parsedMetadata.title);
     } catch (err) {
-      console.error('Upload failed', err);
+      console.error('File reading failed', err);
+      alert('Failed to read file locally: ' + err.message);
     } finally {
       setIsUploading(false);
     }
@@ -359,65 +355,31 @@ export default function Home() {
   const handleUpdate = async () => {
     setIsProcessing(true);
     try {
-      const formData = new FormData();
-      formData.append('fileId', fileId);
-      formData.append('extension', extension);
-      formData.append('format', extension.replace('.', ''));
+      // We pass the file and current metadata to our local WebAssembly FFmpeg engine!
+      const finalBlob = await writeMetadataBrowser(file, metadata);
 
-      // Clone metadata and remove picture from the JSON part to keep it small
-      const tags = { ...metadata };
+      // Create a local download link directly from memory
+      const url = window.URL.createObjectURL(finalBlob);
+      const a = document.createElement('a');
+      a.href = url;
       
-      // If we have a picture, and it's changed (or always for safety, but as a Blob)
-      if (metadata.picture?.data) {
-        // Convert base64 back to Blob to send via FormData
-        const byteCharacters = atob(metadata.picture.data);
-        const byteNumbers = new Array(byteCharacters.length);
-        for (let i = 0; i < byteCharacters.length; i++) {
-          byteNumbers[i] = byteCharacters.charCodeAt(i);
-        }
-        const byteArray = new Uint8Array(byteNumbers);
-        const blob = new Blob([byteArray], { type: metadata.picture.format });
-        formData.append('picture', blob, 'cover' + (metadata.picture.format === 'image/jpeg' ? '.jpg' : '.png'));
-        
-        // Remove data from tags to avoid double sending and hitting limits
-        delete tags.picture;
+      let newName = file.name;
+      if (metadata.artist && metadata.title) {
+        const sArtist = metadata.artist.replace(/[\\/:*?"<>|]/g, '');
+        const sTitle = metadata.title.replace(/[\\/:*?"<>|]/g, '');
+        newName = `${sArtist} - ${sTitle}${extension}`;
       }
-
-      formData.append('tags', JSON.stringify(tags));
-      formData.append('applyReplayGain', applyReplayGain);
-
-      const response = await fetch('/api/update', {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (response.ok) {
-        const blob = await response.blob();
-        const url = window.URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        
-        let newName = file.name;
-        if (metadata.artist && metadata.title) {
-          const sArtist = metadata.artist.replace(/[\\/:*?"<>|]/g, '');
-          const sTitle = metadata.title.replace(/[\\/:*?"<>|]/g, '');
-          newName = `${sArtist} - ${sTitle}${extension}`;
-        }
-        
-        a.download = newName;
-        document.body.appendChild(a);
-        a.click();
-        window.URL.revokeObjectURL(url);
-        setIsSuccess(true);
-        setTimeout(() => setIsSuccess(false), 3000);
-      } else {
-        const errData = await response.json();
-        console.error('Update failed:', errData.error, errData.details);
-        alert(`Failed to save: ${errData.error}${errData.details ? ' (' + errData.details + ')' : ''}`);
-      }
+      
+      a.download = newName;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      
+      setIsSuccess(true);
+      setTimeout(() => setIsSuccess(false), 3000);
     } catch (err) {
-      console.error('Update failed', err);
-      alert('Update failed. Check console for details.');
+      console.error('Update failed locally', err);
+      alert('Local update failed. Check console for details.');
     } finally {
       setIsProcessing(false);
     }
@@ -630,6 +592,18 @@ export default function Home() {
                             }`}
                           >
                             <SlidersHorizontal className="w-5 h-5" />
+                          </button>
+                        </Tooltip>
+
+                        <Tooltip content="Smart Suggestions">
+                          <button 
+                            type="button"
+                            onClick={() => handleAutofill()}
+                            disabled={isAutofilling}
+                            aria-label="Smart Suggestions"
+                            className="w-14 h-14 rounded-2xl bg-white/5 flex items-center justify-center hover:bg-white/10 transition-all border border-white/5 text-white/50 hover:text-white disabled:opacity-50"
+                          >
+                            {isAutofilling ? <Loader2 className="w-5 h-5 animate-spin" /> : <Wand2 className="w-5 h-5" />}
                           </button>
                         </Tooltip>
 
